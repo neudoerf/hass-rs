@@ -1,6 +1,6 @@
 use crate::{
     automation::{Automation, EventListener},
-    types::{Auth, Command, EventData, HassEntity, Response, SubscribeEvents},
+    types::{Auth, CallService, Command, EventData, HassEntity, Response, SubscribeEvents, Target},
     websocket,
 };
 
@@ -82,6 +82,19 @@ impl Hass {
             event_type: Some("state_changed".to_string()),
         };
         self.send(Command::SubscribeEvents(sub)).await;
+    }
+
+    pub async fn call_service(&self, domain: &str, service: &str, target: Option<Target>) {
+        let id = self.get_id().await;
+        let call_service = CallService {
+            id,
+            service_type: "call_service".to_string(),
+            domain: domain.to_owned(),
+            service: service.to_owned(),
+            service_data: None,
+            target,
+        };
+        self.send(Command::CallService(call_service)).await;
     }
 
     async fn process_event(&self, e: EventData) {

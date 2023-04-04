@@ -2,8 +2,9 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::types::EventData;
 
+#[async_trait::async_trait]
 pub trait EventListener {
-    fn fire(&mut self, event_data: EventData);
+    async fn handle_event(&mut self, event_data: EventData);
 }
 
 struct AutomationActor<T>
@@ -24,7 +25,7 @@ where
 
     async fn run(&mut self) {
         while let Some(event_data) = self.receiver.recv().await {
-            self.handler.fire(event_data);
+            self.handler.handle_event(event_data).await;
         }
     }
 }
