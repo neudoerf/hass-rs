@@ -1,9 +1,18 @@
 use crate::{
-    types::{Auth, Command, Response, SubscribeEvents},
+    automation::{Automation, EventListener},
+    types::{Auth, Command, EventData, HassEntity, Response, SubscribeEvents},
     websocket,
 };
 
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::BufReader,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use serde::Deserialize;
 use tokio::sync::{
@@ -19,16 +28,20 @@ struct HassConfig {
 
 impl HassConfig {
     pub fn new(config: String) -> HassConfig {
-        let f = File::open(config).unwrap();
-        let config: HassConfig = serde_yaml::from_reader(BufReader::new(f)).unwrap();
+        let f = File::open(config).expect("unable to open config file");
+        let config: HassConfig =
+            serde_yaml::from_reader(BufReader::new(f)).expect("unable to parse config file");
         return config;
     }
 }
 
+#[derive(Clone)]
 pub struct Hass {
     config: Arc<HassConfig>,
     sender: Option<Sender<Command>>,
-    id: Arc<RwLock<u64>>,
+    id: Arc<AtomicU64>,
+    state: Arc<RwLock<HashMap<String, HassEntity>>>,
+    event_listeners: Arc<RwLock<Vec<Automation>>>,
 }
 
 impl Hass {
@@ -36,8 +49,23 @@ impl Hass {
         Hass {
             config: Arc::new(HassConfig::new(config.to_string())),
             sender: None,
-            id: Arc::new(RwLock::new(0)),
+            id: Arc::new(AtomicU64::new(0)),
+            state: Arc::new(RwLock::new(HashMap::new())),
+            event_listeners: Arc::new(RwLock::new(Vec::<Automation>::new())),
         }
+    }
+
+    pub async fn add_listener<T: EventListener + Send + 'static>(&self, handler: T) {
+        let automation = Automation::new(handler);
+        let mut listeners = self.event_listeners.write().await;
+        listeners.push(automation);
+    }
+
+    async fn get_id(&self) -> u64 {
+        let mut id = self.id.load(Ordering::Relaxed);
+        id += 1;
+        self.id.store(id, Ordering::Release);
+        id
     }
 
     async fn send_auth(&self) {
@@ -48,13 +76,19 @@ impl Hass {
     }
 
     async fn subscribe_events(&self) {
-        let mut id = self.id.write().await;
-        *id += 1;
+        let id = self.get_id().await;
         let sub = SubscribeEvents {
-            id: *id,
+            id,
             event_type: Some("state_changed".to_string()),
         };
         self.send(Command::SubscribeEvents(sub)).await;
+    }
+
+    async fn process_event(&self, e: EventData) {
+        let listeners = self.event_listeners.read().await;
+        for listener in listeners.iter() {
+            listener.send(e.clone()).await
+        }
     }
 
     async fn send(&self, command: Command) {
@@ -104,6 +138,10 @@ impl ResponseActor {
             Response::AuthOk(_) => {
                 let h = self.hass.read().await;
                 h.subscribe_events().await;
+            }
+            Response::Event(e) => {
+                let h = self.hass.read().await;
+                h.process_event(e.event.data).await;
             }
             _ => {}
         }

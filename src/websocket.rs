@@ -49,7 +49,7 @@ async fn read_loop(mut stream: SplitStream<WebSocket>, channel: ResponseHandle) 
                     let message: Result<Response, serde_json::Error> = serde_json::from_str(&t);
                     match message {
                         Ok(r) => {
-                            println!("received message {:?}", r);
+                            // println!("received message {:?}", r);
                             channel.send(r).await;
                         }
                         Err(e) => {
@@ -92,6 +92,6 @@ async fn send_loop(mut send: SplitSink<WebSocket, Message>, mut channel: mpsc::R
                 break;
             }
         }
-        println!("received command");
+        // println!("received command");
     }
 }
