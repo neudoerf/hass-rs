@@ -6,92 +6,127 @@ use futures_util::{
 };
 use tokio::{
     net::TcpStream,
-    select,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
+    task::JoinHandle,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
 use crate::types::{Command, Response};
 
-const API_WEBSOCKET: &str = "/api/websocket";
-
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-pub(crate) async fn start(url: String, hass_recv: ResponseHandle, cmd_recv: Receiver<Command>) {
+struct SendActor {
+    sender: SplitSink<WebSocket, Message>,
+    receiver: Receiver<Command>,
+}
+
+impl SendActor {
+    fn new(sender: SplitSink<WebSocket, Message>, receiver: Receiver<Command>) -> Self {
+        Self { sender, receiver }
+    }
+
+    async fn run(&mut self) {
+        while let Some(command) = self.receiver.recv().await {
+            let message = serde_json::to_string(&command).unwrap();
+            self.sender.send(Message::Text(message)).await.unwrap();
+        }
+    }
+}
+
+struct ReceiveActor {
+    receiver: SplitStream<WebSocket>,
+    channel: ResponseHandle,
+}
+
+impl ReceiveActor {
+    pub(crate) fn new(receiver: SplitStream<WebSocket>, channel: ResponseHandle) -> Self {
+        Self { receiver, channel }
+    }
+
+    async fn run(&mut self) {
+        while let Some(message) = self.receiver.next().await {
+            match message {
+                Ok(m) => match m {
+                    Message::Text(t) => {
+                        let message: Result<Response, serde_json::Error> = serde_json::from_str(&t);
+                        match message {
+                            Ok(r) => {
+                                // println!("received message {:?}", r);
+                                self.channel.send(r).await;
+                            }
+                            Err(e) => {
+                                println!("Failed to deserialize: {}\nError: {}", t, e)
+                            }
+                        }
+                    }
+                    Message::Ping(_) => {
+                        println!("received ping");
+                    }
+                    Message::Pong(_) => {
+                        println!("received pong");
+                    }
+                    Message::Close(_) => {
+                        println!("connection closed by server");
+                        break;
+                    }
+                    _ => {
+                        println!("Non-text message recieved: {:?}", m)
+                    }
+                },
+                Err(e) => {
+                    println!("Error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandHandle {
+    sender: Sender<Command>,
+}
+
+impl CommandHandle {
+    fn new(ws: WebSocket, resp_handle: ResponseHandle) -> (Self, JoinHandle<()>) {
+        let (ws_send, ws_recv) = ws.split();
+        let (cmd_send, cmd_recv) = mpsc::channel::<Command>(10);
+        let send_actor = SendActor::new(ws_send, cmd_recv);
+        let recv_actor = ReceiveActor::new(ws_recv, resp_handle);
+
+        let handle = tokio::spawn(async move { spawn(send_actor, recv_actor).await });
+        (Self { sender: cmd_send }, handle)
+    }
+
+    pub(crate) async fn send(&self, command: Command) {
+        self.sender.send(command).await.unwrap();
+    }
+}
+
+async fn spawn(mut send_actor: SendActor, mut recv_actor: ReceiveActor) {
+    let mut send_handle = tokio::spawn(async move { send_actor.run().await });
+    let mut recv_handle = tokio::spawn(async move { recv_actor.run().await });
+
+    tokio::select! {
+        _ = &mut send_handle => {
+            recv_handle.abort();
+        }
+        _ = &mut recv_handle => {
+            send_handle.abort();
+        }
+    }
+}
+
+pub(crate) async fn start(
+    url_str: String,
+    hass_recv: ResponseHandle,
+) -> (CommandHandle, JoinHandle<()>) {
     // build the url
-    let url_str = format!("{}{}", url, API_WEBSOCKET);
     let url = Url::parse(&url_str).expect(&format!("failed to parse url: {}", url_str));
     // connnect to the server
     let (client, _) = connect_async(url)
         .await
         .expect(&format!("failed to connect to url {}", url_str));
-    let (send, recv) = client.split();
-
-    let mut read_task = tokio::spawn(read_loop(recv, hass_recv));
-    let mut send_task = tokio::spawn(send_loop(send, cmd_recv));
-
-    select! {
-        _ = (&mut read_task) => {
-            send_task.abort();
-        }
-        _ = (&mut send_task) => {
-            read_task.abort();
-        }
-    }
-}
-
-async fn read_loop(mut stream: SplitStream<WebSocket>, channel: ResponseHandle) {
-    loop {
-        match stream.next().await {
-            Some(Ok(m)) => match m {
-                Message::Text(t) => {
-                    let message: Result<Response, serde_json::Error> = serde_json::from_str(&t);
-                    match message {
-                        Ok(r) => {
-                            // println!("received message {:?}", r);
-                            channel.send(r).await;
-                        }
-                        Err(e) => {
-                            println!("Failed to deserialize: {}\nError: {}", t, e)
-                        }
-                    }
-                }
-                Message::Ping(_) => {
-                    println!("received ping");
-                }
-                Message::Pong(_) => {
-                    println!("received pong");
-                }
-                Message::Close(_) => {
-                    println!("connection closed by server");
-                    break;
-                }
-                _ => {
-                    println!("Non-text message recieved: {:?}", m)
-                }
-            },
-            Some(Err(error)) => {
-                println!("Error {}", error);
-            }
-            None => {
-                break;
-            }
-        }
-    }
-}
-
-async fn send_loop(mut send: SplitSink<WebSocket, Message>, mut channel: mpsc::Receiver<Command>) {
-    loop {
-        match channel.recv().await {
-            Some(c) => {
-                let message = serde_json::to_string(&c).unwrap();
-                send.send(Message::Text(message)).await.unwrap();
-            }
-            None => {
-                break;
-            }
-        }
-        // println!("received command");
-    }
+    CommandHandle::new(client, hass_recv)
 }

@@ -5,6 +5,7 @@ mod websocket;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use automation::EventListener;
 use hass::Hass;
 use tokio::{self, sync::RwLock};
@@ -16,7 +17,7 @@ struct TestEvent {
     hass: Arc<RwLock<Hass>>,
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl EventListener for TestEvent {
     async fn handle_event(&mut self, event_data: EventData) {
         println!("received event {:?}", event_data);
@@ -43,10 +44,8 @@ impl EventListener for TestEvent {
 
 #[tokio::main]
 async fn main() {
-    let hass = Arc::new(RwLock::new(Hass::new("config.yaml")));
-
     // run!
-    let hass_task = tokio::spawn(hass::start(hass.clone()));
+    let (hass, task) = hass::start("config.yaml").await;
 
     // add event listeners
     let test_event = TestEvent { hass: hass.clone() };
@@ -55,5 +54,5 @@ async fn main() {
         h.add_listener(test_event).await;
     }
 
-    hass_task.await.expect("error joining hass_task")
+    task.await.expect("error joining hass_task")
 }

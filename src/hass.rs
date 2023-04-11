@@ -1,11 +1,10 @@
 use crate::{
     automation::{Automation, EventListener},
-    types::{Auth, CallService, Command, EventData, HassEntity, Response, SubscribeEvents, Target},
-    websocket,
+    types::{Auth, CallService, Command, EventData, Response, SubscribeEvents, Target},
+    websocket::{self, CommandHandle},
 };
 
 use std::{
-    collections::HashMap,
     fs::File,
     io::BufReader,
     sync::{
@@ -15,13 +14,18 @@ use std::{
 };
 
 use serde::Deserialize;
-use tokio::sync::{
-    mpsc::{self, Receiver, Sender},
-    RwLock,
+use tokio::{
+    sync::{
+        mpsc::{self, Receiver, Sender},
+        RwLock,
+    },
+    task::JoinHandle,
 };
 
+const API_WEBSOCKET: &str = "/api/websocket";
+
 #[derive(Deserialize)]
-struct HassConfig {
+pub struct HassConfig {
     access_token: String,
     url: String,
 }
@@ -35,22 +39,19 @@ impl HassConfig {
     }
 }
 
-#[derive(Clone)]
 pub struct Hass {
     config: Arc<HassConfig>,
-    sender: Option<Sender<Command>>,
+    cmd_handle: Option<CommandHandle>,
     id: Arc<AtomicU64>,
-    state: Arc<RwLock<HashMap<String, HassEntity>>>,
     event_listeners: Arc<RwLock<Vec<Automation>>>,
 }
 
 impl Hass {
-    pub fn new(config: &str) -> Hass {
+    pub fn new(config: HassConfig) -> Hass {
         Hass {
-            config: Arc::new(HassConfig::new(config.to_string())),
-            sender: None,
+            config: Arc::new(config),
+            cmd_handle: None,
             id: Arc::new(AtomicU64::new(0)),
-            state: Arc::new(RwLock::new(HashMap::new())),
             event_listeners: Arc::new(RwLock::new(Vec::<Automation>::new())),
         }
     }
@@ -105,31 +106,28 @@ impl Hass {
     }
 
     async fn send(&self, command: Command) {
-        if let Some(s) = &self.sender {
-            s.send(command)
-                .await
-                .expect("error sending to command channel");
+        if let Some(cmd_handle) = &self.cmd_handle {
+            cmd_handle.send(command).await;
         }
     }
 }
 
-pub async fn start(hass: Arc<RwLock<Hass>>) {
-    // create the channels
+pub async fn start(config: &str) -> (Arc<RwLock<Hass>>, JoinHandle<()>) {
+    let hass_config = HassConfig::new(config.to_string());
+    let hass = Arc::new(RwLock::new(Hass::new(hass_config)));
     let hass_receiver = ResponseHandle::new(hass.clone());
-    let (cmd_send, cmd_recv) = mpsc::channel::<Command>(10);
+    let cmd_handle;
+    let ws_task;
     {
-        let mut h = hass.write().await;
-        h.sender = Some(cmd_send);
+        let h = hass.read().await;
+        (cmd_handle, ws_task) = websocket::start(
+            format!("{}{}", h.config.url.clone(), API_WEBSOCKET),
+            hass_receiver,
+        )
+        .await
     }
-
-    let h = hass.read().await;
-    let ws_task = tokio::spawn(websocket::start(
-        h.config.url.clone(),
-        hass_receiver,
-        cmd_recv,
-    ));
-    ws_task.await.expect("error joining ws_task");
-    println!("websocket closed");
+    hass.write().await.cmd_handle = Some(cmd_handle);
+    (hass, ws_task)
 }
 
 struct ResponseActor {

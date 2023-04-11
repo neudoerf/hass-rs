@@ -1,8 +1,9 @@
+use async_trait::async_trait;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::types::EventData;
 
-#[async_trait::async_trait]
+#[async_trait]
 pub trait EventListener {
     async fn handle_event(&mut self, event_data: EventData);
 }
