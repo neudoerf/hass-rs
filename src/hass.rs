@@ -40,7 +40,7 @@ impl HassConfig {
 }
 
 pub struct Hass {
-    config: Arc<HassConfig>,
+    config: HassConfig,
     cmd_handle: Option<CommandHandle>,
     id: Arc<AtomicU64>,
     event_listeners: Arc<RwLock<Vec<Automation>>>,
@@ -49,7 +49,7 @@ pub struct Hass {
 impl Hass {
     pub fn new(config: HassConfig) -> Hass {
         Hass {
-            config: Arc::new(config),
+            config,
             cmd_handle: None,
             id: Arc::new(AtomicU64::new(0)),
             event_listeners: Arc::new(RwLock::new(Vec::<Automation>::new())),
