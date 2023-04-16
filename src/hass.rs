@@ -1,10 +1,10 @@
 use crate::{
-    automation::{Automation, EventListener},
-    types::{Auth, CallService, Command, EventData, Response, SubscribeEvents, Target},
+    types::{Auth, CallService, Command, EventData, HassEntity, Response, SubscribeEvents, Target},
     websocket::{self, CommandHandle},
 };
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::BufReader,
     sync::{
@@ -14,15 +14,33 @@ use std::{
 };
 
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::{
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        RwLock,
-    },
+    join,
+    sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
 
 const API_WEBSOCKET: &str = "/api/websocket";
+
+#[derive(Debug)]
+pub enum HassCommand {
+    CallService {
+        domain: String,
+        service: String,
+        service_data: Option<Value>,
+        target: Option<Target>,
+    },
+    SubscribeEvents {
+        sender: mpsc::Sender<EventData>,
+    },
+    GetState {
+        entity_id: String,
+        response: oneshot::Sender<Option<HassEntity>>,
+    },
+    Response(Response),
+    SetCommandHandle(CommandHandle),
+}
 
 #[derive(Deserialize)]
 pub struct HassConfig {
@@ -43,23 +61,91 @@ pub struct Hass {
     config: HassConfig,
     cmd_handle: Option<CommandHandle>,
     id: Arc<AtomicU64>,
-    event_listeners: Arc<RwLock<Vec<Automation>>>,
+    event_subscribers: Arc<RwLock<Vec<mpsc::Sender<EventData>>>>,
+    state: Arc<RwLock<HashMap<String, HassEntity>>>,
+    command_channel: mpsc::Receiver<HassCommand>,
 }
 
 impl Hass {
-    pub fn new(config: HassConfig) -> Hass {
+    fn new(config: HassConfig, receiver: mpsc::Receiver<HassCommand>) -> Hass {
         Hass {
             config,
             cmd_handle: None,
             id: Arc::new(AtomicU64::new(0)),
-            event_listeners: Arc::new(RwLock::new(Vec::<Automation>::new())),
+            event_subscribers: Arc::new(RwLock::new(Vec::new())),
+            state: Arc::new(RwLock::new(HashMap::new())),
+            command_channel: receiver,
         }
     }
 
-    pub async fn add_listener<T: EventListener + Send + 'static>(&self, handler: T) {
-        let automation = Automation::new(handler);
-        let mut listeners = self.event_listeners.write().await;
-        listeners.push(automation);
+    async fn add_subscriber(&self, sender: mpsc::Sender<EventData>) {
+        let mut subscribers = self.event_subscribers.write().await;
+        subscribers.push(sender);
+    }
+
+    async fn get_state(&self, entity_id: String) -> Option<HassEntity> {
+        let state = self.state.read().await;
+        state.get(&entity_id).cloned()
+    }
+
+    async fn run(&mut self) {
+        while let Some(command) = self.command_channel.recv().await {
+            match command {
+                HassCommand::CallService {
+                    domain,
+                    service,
+                    service_data,
+                    target,
+                } => {
+                    self.call_service(&domain, &service, service_data, target)
+                        .await;
+                }
+                HassCommand::SubscribeEvents { sender } => {
+                    self.add_subscriber(sender).await;
+                }
+                HassCommand::GetState {
+                    entity_id,
+                    response,
+                } => {
+                    let state = self.get_state(entity_id).await;
+                    response.send(state).unwrap();
+                }
+                HassCommand::Response(response) => {
+                    self.process_response(response).await;
+                }
+                HassCommand::SetCommandHandle(handle) => {
+                    self.cmd_handle = Some(handle);
+                }
+            }
+        }
+    }
+
+    async fn process_response(&self, response: Response) {
+        match response {
+            Response::Event(data) => {
+                if data.event.event_type == "state_changed" {
+                    let mut state = self.state.write().await;
+                    let entity_id = data.event.data.entity_id.clone();
+                    let new_state = data.event.data.new_state.clone();
+                    if let Some(new_state) = new_state {
+                        state.insert(entity_id, new_state);
+                    }
+                }
+                self.process_event(data.event.data).await;
+            }
+            Response::AuthRequired(_) => {
+                println!("Got auth required");
+                self.send_auth().await;
+            }
+            Response::AuthOk(_) => {
+                println!("Got auth ok");
+                self.subscribe_events().await;
+            }
+            Response::AuthInvalid(_) => {
+                println!("Got auth invalid");
+            }
+            _ => {}
+        }
     }
 
     async fn get_id(&self) -> u64 {
@@ -85,23 +171,29 @@ impl Hass {
         self.send(Command::SubscribeEvents(sub)).await;
     }
 
-    pub async fn call_service(&self, domain: &str, service: &str, target: Option<Target>) {
+    pub async fn call_service(
+        &self,
+        domain: &str,
+        service: &str,
+        service_data: Option<Value>,
+        target: Option<Target>,
+    ) {
         let id = self.get_id().await;
         let call_service = CallService {
             id,
             service_type: "call_service".to_string(),
             domain: domain.to_owned(),
             service: service.to_owned(),
-            service_data: None,
+            service_data,
             target,
         };
         self.send(Command::CallService(call_service)).await;
     }
 
     async fn process_event(&self, e: EventData) {
-        let listeners = self.event_listeners.read().await;
-        for listener in listeners.iter() {
-            listener.send(e.clone()).await
+        let subscribers = self.event_subscribers.read().await;
+        for subscriber in subscribers.iter() {
+            let _ = subscriber.send(e.clone()).await.unwrap();
         }
     }
 
@@ -112,50 +204,35 @@ impl Hass {
     }
 }
 
-pub async fn start(config: &str) -> (Arc<RwLock<Hass>>, JoinHandle<()>) {
+pub async fn start(config: &str) -> (mpsc::Sender<HassCommand>, JoinHandle<()>) {
     let hass_config = HassConfig::new(config.to_string());
-    let hass = Arc::new(RwLock::new(Hass::new(hass_config)));
-    let hass_receiver = ResponseHandle::new(hass.clone());
-    let cmd_handle;
-    let ws_task;
-    {
-        let h = hass.read().await;
-        (cmd_handle, ws_task) = websocket::start(
-            format!("{}{}", h.config.url.clone(), API_WEBSOCKET),
-            hass_receiver,
-        )
-        .await
-    }
-    hass.write().await.cmd_handle = Some(cmd_handle);
-    (hass, ws_task)
+    let (hass_sender, hass_receiver) = mpsc::channel(10);
+    let response_handle = ResponseHandle::new(hass_sender.clone());
+    let ws_task = tokio::spawn(websocket::start(
+        format!("{}{}", hass_config.url.clone(), API_WEBSOCKET),
+        response_handle,
+        hass_sender.clone(),
+    ));
+    let mut hass = Hass::new(hass_config, hass_receiver);
+    let hass_task = tokio::spawn(async move { hass.run().await });
+    let task = tokio::spawn(async move {
+        let _ = join!(hass_task, ws_task);
+    });
+    (hass_sender, task)
 }
 
 struct ResponseActor {
-    receiver: Receiver<Response>,
-    hass: Arc<RwLock<Hass>>,
+    receiver: mpsc::Receiver<Response>,
+    sender: mpsc::Sender<HassCommand>,
 }
 
 impl ResponseActor {
-    fn new(receiver: Receiver<Response>, hass: Arc<RwLock<Hass>>) -> Self {
-        Self { receiver, hass }
+    fn new(receiver: mpsc::Receiver<Response>, sender: mpsc::Sender<HassCommand>) -> Self {
+        Self { receiver, sender }
     }
 
     async fn handle_message(&mut self, response: Response) {
-        match response {
-            Response::AuthRequired(_) => {
-                let h = self.hass.read().await;
-                h.send_auth().await;
-            }
-            Response::AuthOk(_) => {
-                let h = self.hass.read().await;
-                h.subscribe_events().await;
-            }
-            Response::Event(e) => {
-                let h = self.hass.read().await;
-                h.process_event(e.event.data).await;
-            }
-            _ => {}
-        }
+        let _ = self.sender.send(HassCommand::Response(response)).await;
     }
 
     async fn run(&mut self) {
@@ -165,14 +242,15 @@ impl ResponseActor {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct ResponseHandle {
-    sender: Sender<Response>,
+    sender: mpsc::Sender<Response>,
 }
 
 impl ResponseHandle {
-    pub(crate) fn new(hass: Arc<RwLock<Hass>>) -> Self {
+    pub(crate) fn new(cmd_send: mpsc::Sender<HassCommand>) -> Self {
         let (sender, receiver) = mpsc::channel::<Response>(10);
-        let mut actor = ResponseActor::new(receiver, hass);
+        let mut actor = ResponseActor::new(receiver, cmd_send);
         tokio::spawn(async move { actor.run().await });
         Self { sender }
     }

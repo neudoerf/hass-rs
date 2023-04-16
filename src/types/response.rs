@@ -3,7 +3,7 @@ use serde_json::Value;
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum Response {
+pub enum Response {
     AuthRequired(AuthRequired),
     AuthOk(AuthOk),
     AuthInvalid(AuthInvalid),

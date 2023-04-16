@@ -1,4 +1,6 @@
-use crate::hass::ResponseHandle;
+use std::time::Duration;
+
+use crate::hass::{HassCommand, ResponseHandle};
 
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -8,6 +10,7 @@ use tokio::{
     net::TcpStream,
     sync::mpsc::{self, Receiver, Sender},
     task::JoinHandle,
+    time::timeout,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
@@ -45,37 +48,48 @@ impl ReceiveActor {
     }
 
     async fn run(&mut self) {
-        while let Some(message) = self.receiver.next().await {
-            match message {
-                Ok(m) => match m {
-                    Message::Text(t) => {
-                        let message: Result<Response, serde_json::Error> = serde_json::from_str(&t);
-                        match message {
-                            Ok(r) => {
-                                // println!("received message {:?}", r);
-                                self.channel.send(r).await;
-                            }
-                            Err(e) => {
-                                println!("Failed to deserialize: {}\nError: {}", t, e)
+        loop {
+            match timeout(Duration::from_secs(60), self.receiver.next()).await {
+                Ok(Some(message)) => match message {
+                    Ok(m) => match m {
+                        Message::Text(t) => {
+                            let message: Result<Response, serde_json::Error> =
+                                serde_json::from_str(&t);
+                            match message {
+                                Ok(r) => {
+                                    // println!("received message {:?}", r);
+                                    self.channel.send(r).await;
+                                }
+                                Err(e) => {
+                                    println!("Failed to deserialize: {}\nError: {}", t, e)
+                                }
                             }
                         }
-                    }
-                    Message::Ping(_) => {
-                        println!("received ping");
-                    }
-                    Message::Pong(_) => {
-                        println!("received pong");
-                    }
-                    Message::Close(_) => {
-                        println!("connection closed by server");
+                        Message::Ping(_) => {
+                            println!("received ping");
+                        }
+                        Message::Pong(_) => {
+                            println!("received pong");
+                        }
+                        Message::Close(_) => {
+                            println!("connection closed by server");
+                            break;
+                        }
+                        _ => {
+                            println!("Non-text message recieved: {:?}", m)
+                        }
+                    },
+                    Err(e) => {
+                        println!("Error: {}", e);
                         break;
                     }
-                    _ => {
-                        println!("Non-text message recieved: {:?}", m)
-                    }
                 },
-                Err(e) => {
-                    println!("Error: {}", e);
+                Ok(None) => {
+                    println!("Connection closed");
+                    break;
+                }
+                Err(_) => {
+                    println!("Timeout");
                     break;
                 }
             }
@@ -83,8 +97,8 @@ impl ReceiveActor {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct CommandHandle {
+#[derive(Clone, Debug)]
+pub struct CommandHandle {
     sender: Sender<Command>,
 }
 
@@ -121,12 +135,23 @@ async fn spawn(mut send_actor: SendActor, mut recv_actor: ReceiveActor) {
 pub(crate) async fn start(
     url_str: String,
     hass_recv: ResponseHandle,
-) -> (CommandHandle, JoinHandle<()>) {
+    hass_sender: Sender<HassCommand>,
+) {
     // build the url
     let url = Url::parse(&url_str).expect(&format!("failed to parse url: {}", url_str));
-    // connnect to the server
-    let (client, _) = connect_async(url)
-        .await
-        .expect(&format!("failed to connect to url {}", url_str));
-    CommandHandle::new(client, hass_recv)
+    loop {
+        // connnect to the server
+        if let Ok((client, _)) = connect_async(url.clone()).await {
+            println!("Connected to {}", url_str);
+            let (handle, task) = CommandHandle::new(client, hass_recv.clone());
+            hass_sender
+                .send(HassCommand::SetCommandHandle(handle))
+                .await
+                .unwrap();
+            task.await.unwrap();
+        } else {
+            println!("Failed to connect to {}", url_str);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
 }
