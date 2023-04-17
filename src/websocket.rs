@@ -30,9 +30,20 @@ impl SendActor {
     }
 
     async fn run(&mut self) {
-        while let Some(command) = self.receiver.recv().await {
-            let message = serde_json::to_string(&command).unwrap();
-            self.sender.send(Message::Text(message)).await.unwrap();
+        loop {
+            match timeout(Duration::from_secs(8), self.receiver.recv()).await {
+                Ok(Some(command)) => {
+                    let message = serde_json::to_string(&command).unwrap();
+                    self.sender.send(Message::Text(message)).await.unwrap();
+                }
+                Ok(None) => {
+                    println!("Connection closed");
+                    break;
+                }
+                Err(_) => {
+                    self.sender.send(Message::Ping(vec![])).await.unwrap();
+                }
+            }
         }
     }
 }
@@ -49,7 +60,7 @@ impl ReceiveActor {
 
     async fn run(&mut self) {
         loop {
-            match timeout(Duration::from_secs(60), self.receiver.next()).await {
+            match timeout(Duration::from_secs(18), self.receiver.next()).await {
                 Ok(Some(message)) => match message {
                     Ok(m) => match m {
                         Message::Text(t) => {
