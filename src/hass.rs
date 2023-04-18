@@ -133,8 +133,10 @@ impl Hass {
             }
             Response::AuthOk(_) => {
                 println!("Got auth ok");
-                self.fetch_states_id = Some(self.fetch_states().await);
+                // subscribe to the event stream
                 self.subscribe_events().await;
+                // fetch all current states
+                self.fetch_states_id = Some(self.fetch_states().await);
             }
             Response::AuthInvalid(_) => {
                 println!("Got auth invalid");
