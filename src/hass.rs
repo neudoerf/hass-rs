@@ -1,24 +1,18 @@
 use crate::{
-    types::{Auth, CallService, Command, EventData, HassEntity, Response, SubscribeEvents, Target},
+    types::{
+        Auth, CallService, Command, EventData, GetStates, HassEntity, Response, SubscribeEvents,
+        Target,
+    },
     websocket::{self, CommandHandle},
 };
 
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::BufReader,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, fs::File, io::BufReader};
 
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
     join,
-    sync::{mpsc, oneshot, RwLock},
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -61,10 +55,11 @@ impl HassConfig {
 pub struct Hass {
     config: HassConfig,
     cmd_handle: Option<CommandHandle>,
-    id: Arc<AtomicU64>,
-    event_subscribers: Arc<RwLock<Vec<mpsc::Sender<EventData>>>>,
-    state: Arc<RwLock<HashMap<String, HassEntity>>>,
+    id: u64,
+    event_subscribers: Vec<mpsc::Sender<EventData>>,
+    state: HashMap<String, HassEntity>,
     command_channel: mpsc::Receiver<HassCommand>,
+    fetch_states_id: Option<u64>,
 }
 
 impl Hass {
@@ -72,21 +67,20 @@ impl Hass {
         Hass {
             config,
             cmd_handle: None,
-            id: Arc::new(AtomicU64::new(0)),
-            event_subscribers: Arc::new(RwLock::new(Vec::new())),
-            state: Arc::new(RwLock::new(HashMap::new())),
+            id: 0,
+            event_subscribers: Vec::new(),
+            state: HashMap::new(),
             command_channel: receiver,
+            fetch_states_id: None,
         }
     }
 
-    async fn add_subscriber(&self, sender: mpsc::Sender<EventData>) {
-        let mut subscribers = self.event_subscribers.write().await;
-        subscribers.push(sender);
+    async fn add_subscriber(&mut self, sender: mpsc::Sender<EventData>) {
+        self.event_subscribers.push(sender);
     }
 
     async fn get_state(&self, entity_id: String) -> Option<HassEntity> {
-        let state = self.state.read().await;
-        state.get(&entity_id).cloned()
+        self.state.get(&entity_id).cloned()
     }
 
     async fn run(&mut self) {
@@ -121,15 +115,14 @@ impl Hass {
         }
     }
 
-    async fn process_response(&self, response: Response) {
+    async fn process_response(&mut self, response: Response) {
         match response {
             Response::Event(data) => {
                 if data.event.event_type == "state_changed" {
-                    let mut state = self.state.write().await;
                     let entity_id = data.event.data.entity_id.clone();
                     let new_state = data.event.data.new_state.clone();
                     if let Some(new_state) = new_state {
-                        state.insert(entity_id, new_state);
+                        self.state.insert(entity_id, new_state);
                     }
                 }
                 self.process_event(data.event.data).await;
@@ -140,20 +133,39 @@ impl Hass {
             }
             Response::AuthOk(_) => {
                 println!("Got auth ok");
+                self.fetch_states_id = Some(self.fetch_states().await);
                 self.subscribe_events().await;
             }
             Response::AuthInvalid(_) => {
                 println!("Got auth invalid");
             }
+            Response::Result(result) => match self.fetch_states_id {
+                Some(id) if id == result.id => {
+                    match result.result {
+                        Some(Value::Array(states)) => {
+                            for state in states {
+                                if let Ok(state) =
+                                    serde_json::from_value::<HassEntity>(state.clone())
+                                {
+                                    self.state.insert(state.entity_id.clone(), state);
+                                } else {
+                                    println!("Unable to parse state: {:#?}", state);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.fetch_states_id = None;
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
-    async fn get_id(&self) -> u64 {
-        let mut id = self.id.load(Ordering::Relaxed);
-        id += 1;
-        self.id.store(id, Ordering::Release);
-        id
+    fn get_id(&mut self) -> u64 {
+        self.id += 1;
+        self.id
     }
 
     async fn send_auth(&self) {
@@ -163,8 +175,8 @@ impl Hass {
         self.send(Command::Auth(auth)).await;
     }
 
-    async fn subscribe_events(&self) {
-        let id = self.get_id().await;
+    async fn subscribe_events(&mut self) {
+        let id = self.get_id();
         let sub = SubscribeEvents {
             id,
             event_type: Some("state_changed".to_string()),
@@ -172,14 +184,24 @@ impl Hass {
         self.send(Command::SubscribeEvents(sub)).await;
     }
 
+    async fn fetch_states(&mut self) -> u64 {
+        let id = self.get_id();
+        let get_state = GetStates {
+            id,
+            command_type: "get_states".to_string(),
+        };
+        self.send(Command::GetStates(get_state)).await;
+        id
+    }
+
     pub async fn call_service(
-        &self,
+        &mut self,
         domain: &str,
         service: &str,
         service_data: Option<Value>,
         target: Option<Target>,
     ) {
-        let id = self.get_id().await;
+        let id = self.get_id();
         let call_service = CallService {
             id,
             service_type: "call_service".to_string(),
@@ -192,8 +214,7 @@ impl Hass {
     }
 
     async fn process_event(&self, e: EventData) {
-        let subscribers = self.event_subscribers.read().await;
-        for subscriber in subscribers.iter() {
+        for subscriber in self.event_subscribers.iter() {
             let _ = subscriber.send(e.clone()).await.unwrap();
         }
     }

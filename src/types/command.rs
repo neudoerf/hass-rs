@@ -6,6 +6,7 @@ pub enum Command {
     Auth(Auth),
     SubscribeEvents(SubscribeEvents),
     CallService(CallService),
+    GetStates(GetStates),
 }
 
 #[derive(Serialize, Debug)]
@@ -36,4 +37,11 @@ pub struct CallService {
 #[derive(Serialize, Debug)]
 pub struct Target {
     pub entity_id: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct GetStates {
+    pub id: u64,
+    #[serde(rename = "type")]
+    pub command_type: String,
 }
