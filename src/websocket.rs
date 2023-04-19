@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use crate::hass::{HassCommand, ResponseHandle};
-
 use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
@@ -15,7 +13,10 @@ use tokio::{
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use url::Url;
 
-use crate::types::{Command, Response};
+use crate::{
+    types::{Command, Response},
+    HassCommand, ResponseHandle,
+};
 
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 

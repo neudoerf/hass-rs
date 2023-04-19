@@ -1,15 +1,8 @@
-mod automation;
-mod hass;
-mod types;
-mod websocket;
-
 use std::time::Duration;
 
-use hass::HassCommand;
+use hass_rs::types::{EventData, Target};
+use hass_rs::{automation, HassCommand};
 use tokio::{self, sync::mpsc, task::JoinHandle};
-use types::EventData;
-
-use crate::types::Target;
 
 struct TestEvent {
     hass: mpsc::Sender<HassCommand>,
@@ -109,7 +102,7 @@ impl TestEvent {
 #[tokio::main]
 async fn main() {
     // run!
-    let (hass, task) = hass::start("config.yaml").await;
+    let (hass, task) = hass_rs::start("config.yaml").await;
 
     // add event listeners
     let mut test_event = TestEvent::new(hass.clone());

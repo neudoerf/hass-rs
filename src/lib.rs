@@ -1,10 +1,6 @@
-use crate::{
-    types::{
-        Auth, CallService, Command, EventData, GetStates, HassEntity, Response, SubscribeEvents,
-        Target,
-    },
-    websocket::{self, CommandHandle},
-};
+pub mod automation;
+pub mod types;
+mod websocket;
 
 use std::{collections::HashMap, fs::File, io::BufReader};
 
@@ -15,6 +11,10 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use types::{
+    Auth, CallService, Command, EventData, GetStates, HassEntity, Response, SubscribeEvents, Target,
+};
+use websocket::CommandHandle;
 
 const API_WEBSOCKET: &str = "/api/websocket";
 
