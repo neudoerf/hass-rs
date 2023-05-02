@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
     join,
-    sync::{mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use types::{
@@ -27,7 +27,7 @@ pub enum HassCommand {
         target: Option<Target>,
     },
     SubscribeEvents {
-        sender: mpsc::Sender<EventData>,
+        sender: oneshot::Sender<broadcast::Receiver<EventData>>,
     },
     GetState {
         entity_id: String,
@@ -56,7 +56,7 @@ pub struct Hass {
     config: HassConfig,
     cmd_handle: Option<CommandHandle>,
     id: u64,
-    event_subscribers: Vec<mpsc::Sender<EventData>>,
+    event_channel: broadcast::Sender<EventData>,
     state: HashMap<String, HassEntity>,
     command_channel: mpsc::Receiver<HassCommand>,
     fetch_states_id: Option<u64>,
@@ -64,19 +64,20 @@ pub struct Hass {
 
 impl Hass {
     fn new(config: HassConfig, receiver: mpsc::Receiver<HassCommand>) -> Hass {
+        let (tx, _) = broadcast::channel(10);
         Hass {
             config,
             cmd_handle: None,
             id: 0,
-            event_subscribers: Vec::new(),
+            event_channel: tx,
             state: HashMap::new(),
             command_channel: receiver,
             fetch_states_id: None,
         }
     }
 
-    async fn add_subscriber(&mut self, sender: mpsc::Sender<EventData>) {
-        self.event_subscribers.push(sender);
+    fn get_event_channel(&mut self) -> broadcast::Receiver<EventData> {
+        self.event_channel.subscribe()
     }
 
     async fn get_state(&self, entity_id: String) -> Option<HassEntity> {
@@ -96,13 +97,15 @@ impl Hass {
                         .await;
                 }
                 HassCommand::SubscribeEvents { sender } => {
-                    self.add_subscriber(sender).await;
+                    // don't care if sending fails
+                    let _ = sender.send(self.get_event_channel());
                 }
                 HassCommand::GetState {
                     entity_id,
                     response,
                 } => {
                     let state = self.get_state(entity_id).await;
+                    println!("Sending state: {:#?}", state);
                     response.send(state).unwrap();
                 }
                 HassCommand::Response(response) => {
@@ -125,7 +128,8 @@ impl Hass {
                         self.state.insert(entity_id, new_state);
                     }
                 }
-                self.process_event(data.event.data).await;
+                // only fails if there are no receivers, which we don't care about
+                let _ = self.event_channel.send(data.event.data);
             }
             Response::AuthRequired(_) => {
                 println!("Got auth required");
@@ -215,12 +219,6 @@ impl Hass {
         self.send(Command::CallService(call_service)).await;
     }
 
-    async fn process_event(&self, e: EventData) {
-        for subscriber in self.event_subscribers.iter() {
-            let _ = subscriber.send(e.clone()).await.unwrap();
-        }
-    }
-
     async fn send(&self, command: Command) {
         if let Some(cmd_handle) = &self.cmd_handle {
             cmd_handle.send(command).await;
@@ -230,7 +228,7 @@ impl Hass {
 
 pub async fn start(config: &str) -> (mpsc::Sender<HassCommand>, JoinHandle<()>) {
     let hass_config = HassConfig::new(config.to_string());
-    let (hass_sender, hass_receiver) = mpsc::channel(10);
+    let (hass_sender, hass_receiver) = mpsc::channel(5);
     let response_handle = ResponseHandle::new(hass_sender.clone());
     let ws_task = tokio::spawn(websocket::start(
         format!("{}{}", hass_config.url.clone(), API_WEBSOCKET),

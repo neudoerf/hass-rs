@@ -1,16 +1,16 @@
 use std::time::Duration;
 
+use hass_rs::automation::Automation;
 use hass_rs::types::{EventData, Target};
 use hass_rs::{automation, HassCommand};
 use tokio::{self, sync::mpsc, task::JoinHandle};
 
 struct TestEvent {
     hass: mpsc::Sender<HassCommand>,
-    handle: Option<JoinHandle<()>>,
     cmd_send: mpsc::Sender<TestEventCommand>,
-    cmd_recv: mpsc::Receiver<TestEventCommand>,
-    event_send: mpsc::Sender<EventData>,
-    event_recv: mpsc::Receiver<EventData>,
+    trigger: String,
+    entity: String,
+    handle: Option<JoinHandle<()>>,
 }
 
 enum TestEventCommand {
@@ -18,42 +18,33 @@ enum TestEventCommand {
 }
 
 impl TestEvent {
-    fn new(hass: mpsc::Sender<HassCommand>) -> Self {
-        let (event_send, event_recv) = mpsc::channel(10);
-        let (cmd_send, cmd_recv) = mpsc::channel(10);
-        Self {
+    async fn start(
+        hass: mpsc::Sender<HassCommand>,
+        trigger: String,
+        entity: String,
+    ) -> JoinHandle<()> {
+        let (cmd_send, cmd_recv) = mpsc::channel(1);
+        automation::new(
+            TestEvent {
+                hass: hass.clone(),
+                cmd_send,
+                trigger,
+                entity,
+                handle: None,
+            },
             hass,
-            handle: None,
-            cmd_send,
             cmd_recv,
-            event_send,
-            event_recv,
-        }
+        )
+        .await
     }
+}
 
-    async fn run(&mut self) {
-        let c = HassCommand::SubscribeEvents {
-            sender: self.event_send.clone(),
-        };
-        self.hass.send(c).await.unwrap();
-        loop {
-            tokio::select! {
-                event_data = self.event_recv.recv() => {
-                    if let Some(event_data) = event_data {
-                        self.event(event_data).await;
-                    }
-                },
-                cmd = self.cmd_recv.recv() => {
-                    if let Some(cmd) = cmd {
-                        self.command(cmd).await;
-                    }
-                }
-            }
-        }
-    }
+#[async_trait::async_trait]
+impl Automation for TestEvent {
+    type AutomationCommand = TestEventCommand;
 
     async fn event(&mut self, event_data: EventData) {
-        if event_data.entity_id == "input_boolean.test" {
+        if event_data.entity_id == self.trigger {
             if let Some(state) = event_data.new_state {
                 if state.state == "on" {
                     if let Some(handle) = &self.handle {
@@ -65,7 +56,7 @@ impl TestEvent {
                             service: "turn_on".to_owned(),
                             service_data: None,
                             target: Some(Target {
-                                entity_id: "light.front_hall".to_owned(),
+                                entity_id: self.entity.clone(),
                             }),
                         };
                         self.hass.send(c).await.unwrap();
@@ -89,13 +80,17 @@ impl TestEvent {
                     service: "turn_off".to_owned(),
                     service_data: None,
                     target: Some(Target {
-                        entity_id: "light.front_hall".to_owned(),
+                        entity_id: self.entity.clone(),
                     }),
                 };
                 self.hass.send(c).await.unwrap();
                 self.handle = None;
             }
         }
+    }
+
+    fn get_command_channel(&self) -> mpsc::Sender<TestEventCommand> {
+        self.cmd_send.clone()
     }
 }
 
@@ -105,8 +100,12 @@ async fn main() {
     let (hass, task) = hass_rs::start("config.yaml").await;
 
     // add event listeners
-    let mut test_event = TestEvent::new(hass.clone());
-    let _ = tokio::spawn(async move { test_event.run().await });
+    TestEvent::start(
+        hass.clone(),
+        "input_boolean.test".to_owned(),
+        "light.front_hall".to_owned(),
+    )
+    .await;
 
     task.await.expect("error joining hass_task")
 }
