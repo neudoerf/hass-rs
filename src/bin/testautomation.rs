@@ -26,13 +26,12 @@ impl TestEvent {
         let (cmd_send, cmd_recv) = mpsc::channel(1);
         automation::new(
             TestEvent {
-                hass: hass.clone(),
+                hass,
                 cmd_send,
                 trigger,
                 entity,
                 handle: None,
             },
-            hass,
             cmd_recv,
         )
         .await
@@ -91,6 +90,10 @@ impl Automation for TestEvent {
 
     fn get_command_channel(&self) -> mpsc::Sender<TestEventCommand> {
         self.cmd_send.clone()
+    }
+
+    fn get_hass(&self) -> mpsc::Sender<HassCommand> {
+        self.hass.clone()
     }
 }
 

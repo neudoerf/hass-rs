@@ -21,12 +21,12 @@ pub fn run_in<T: Send + 'static>(
 
 pub async fn new<T: Automation + Send + 'static>(
     automation: T,
-    hass_sender: mpsc::Sender<HassCommand>,
     cmd_recv: mpsc::Receiver<T::AutomationCommand>,
 ) -> JoinHandle<()> {
     // first we need to get the event receiver
     let (tx, rx) = oneshot::channel::<broadcast::Receiver<EventData>>();
     let cmd = HassCommand::SubscribeEvents { sender: tx };
+    let hass_sender = automation.get_hass();
     // only panics if the receiver has been dropped, which means the hass thread has died
     hass_sender.send(cmd).await.unwrap();
     // wait for Hass to respond with the event receiver
@@ -45,6 +45,8 @@ pub trait Automation {
     async fn command(&mut self, command: Self::AutomationCommand);
 
     fn get_command_channel(&self) -> mpsc::Sender<Self::AutomationCommand>;
+
+    fn get_hass(&self) -> mpsc::Sender<HassCommand>;
 }
 
 struct HassAutomation<T>
